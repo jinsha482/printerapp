@@ -143,6 +143,10 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
       await for (HttpRequest request in _server!) {
         if (request.method == 'POST') {
           Uint8List ippData = await receivePdfData(request);
+          debugIppData(ippData);
+          // Log full byte data
+          print("📥 Full Received IPP Data: $ippData");
+
           try {
             Uint8List? pdfData =
                 await platform.invokeMethod('parseIpp', {'ippData': ippData});
@@ -159,7 +163,6 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
                 ..close();
             }
           } catch (error) {
-            print(ippData);
             print("❌ Error parsing IPP request: $error");
             request.response
               ..statusCode = HttpStatus.badRequest
@@ -167,11 +170,32 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
               ..close();
           }
         } else {
-          // ... (Your existing code) ...
+          print("🔹 Non-POST request received: ${request.method}");
         }
       }
     } catch (e) {
       print("❌ Error starting HTTP server: $e");
+    }
+  }
+
+  void debugIppData(Uint8List ippData) {
+    print("📥 IPP Data: $ippData");
+
+    // Look for PDF Signature
+    int pdfStartIndex = ippData.indexOf(37); // '%' = 37 in ASCII
+    if (pdfStartIndex != -1 && ippData.length > pdfStartIndex + 3) {
+      if (ippData[pdfStartIndex + 1] == 80 && // 'P'
+          ippData[pdfStartIndex + 2] == 68 && // 'D'
+          ippData[pdfStartIndex + 3] == 70) {
+        // 'F'
+        print("📄 Found PDF data starting at index: $pdfStartIndex");
+        Uint8List pdfBytes = ippData.sublist(pdfStartIndex);
+        print("PDF Data: $pdfBytes");
+      } else {
+        print("❌ PDF Signature Not Found!");
+      }
+    } else {
+      print("❌ No PDF Signature in the IPP Request");
     }
   }
 
@@ -180,7 +204,31 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
     await for (var data in request) {
       receivedData.addAll(data);
     }
+    saveIPPDocument(Uint8List.fromList(receivedData));
     return Uint8List.fromList(receivedData);
+  }
+
+  void saveIPPDocument(Uint8List ippData) async {
+    // Find the end of the IPP attribute section
+    int docStartIndex = ippData.indexOf(0x03); // 0x03 marks end of attributes
+
+    if (docStartIndex == -1) {
+      print("Invalid IPP data: No end-of-attributes marker found!");
+      return;
+    }
+
+    // Extract document data (after 0x03)
+    Uint8List documentData = ippData.sublist(docStartIndex + 1);
+
+    // Determine document format (defaulting to PDF)
+    String filePath =
+        "/storage/emulated/0/Download/printed_document.pdf"; // Android storage path
+    File file = File(filePath);
+
+    // Write extracted data to file
+    await file.writeAsBytes(documentData);
+
+    print("Document saved at: $filePath");
   }
 
   void handlePrint() {
