@@ -1,5 +1,4 @@
 package com.example.newprinterapp
-
 import android.print.PrintJobInfo
 import android.print.PrinterId
 import android.print.PrinterInfo
