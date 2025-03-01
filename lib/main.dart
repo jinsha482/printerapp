@@ -1,12 +1,13 @@
 import 'dart:io';
 import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter_pdfview/flutter_pdfview.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -83,7 +84,7 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
   static HttpServer? _server;
   final Box _serviceBox = Hive.box('serviceBox');
   final Connectivity _connectivity = Connectivity();
-  static const platform = MethodChannel('ipp_parser');
+
   @override
   void initState() {
     super.initState();
@@ -93,12 +94,40 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
 
     _connectivity.onConnectivityChanged.listen((ConnectivityResult result) {
       if (result == ConnectivityResult.wifi) {
-        print("📡 Wi-Fi Reconnected! Restarting Print Service...");
         if (!_isServiceRunning) {
           startBonjourService();
         }
       }
     });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text("Print Service")),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              _isServiceRunning ? "Service is Running" : "Service is Stopped",
+              style: TextStyle(fontSize: 18),
+            ),
+            SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () {
+                if (_isServiceRunning) {
+                  stopBonjourService();
+                } else {
+                  startBonjourService();
+                }
+              },
+              child: Text(_isServiceRunning ? "Stop Service" : "Start Service"),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> startBonjourService() async {
@@ -118,7 +147,6 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
       await _bonsoirBroadcast!.start();
       setState(() => _isServiceRunning = true);
       _serviceBox.put('isServiceRunning', true);
-      print("✅ Bonjour service started");
     } catch (error) {
       print("❌ Failed to start Bonjour service: $error");
     }
@@ -129,7 +157,6 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
     _bonsoirBroadcast = null;
     setState(() => _isServiceRunning = false);
     _serviceBox.put('isServiceRunning', false);
-    print("🛑 Bonjour service stopped");
   }
 
   Future<void> startHttpServer() async {
@@ -141,33 +168,28 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
       print("🖨️ HTTP Server Running on Port 8080");
 
       await for (HttpRequest request in _server!) {
+        print("📥 Received Request: ${request.method} at ${request.uri.path}");
+
         if (request.method == 'POST') {
+          print("📩 Handling POST request...");
           Uint8List ippData = await receivePdfData(request);
-          debugIppData(ippData);
-          // Log full byte data
-          print("📥 Full Received IPP Data: $ippData");
+          // debugIppData(ippData);
 
-          try {
-            Uint8List? pdfData =
-                await platform.invokeMethod('parseIpp', {'ippData': ippData});
-
-            if (pdfData != null) {
-              print("📄 PDF Data Length: ${pdfData.length} bytes");
-              setState(() => _pdfData = pdfData);
-              handlePrint();
-            } else {
-              print("❌ PDF data not found in IPP request");
-              request.response
-                ..statusCode = HttpStatus.badRequest
-                ..write('❌ PDF data not found in IPP request')
-                ..close();
-            }
-          } catch (error) {
-            print("❌ Error parsing IPP request: $error");
+          if (ippData.isEmpty) {
+            print("❌ No data received in IPP request!");
             request.response
               ..statusCode = HttpStatus.badRequest
-              ..write('❌ Invalid IPP Request!')
+              ..write('❌ No IPP data received!')
               ..close();
+            continue;
+          }
+
+          // Attempt to process IPP data
+          try {
+            saveIPPDocument(ippData);
+            print("✅ Successfully extracted document from IPP request.");
+          } catch (error) {
+            print("❌ Error processing IPP request: $error");
           }
         } else {
           print("🔹 Non-POST request received: ${request.method}");
@@ -178,57 +200,128 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
     }
   }
 
-  void debugIppData(Uint8List ippData) {
-    print("📥 IPP Data: $ippData");
-
-    // Look for PDF Signature
-    int pdfStartIndex = ippData.indexOf(37); // '%' = 37 in ASCII
-    if (pdfStartIndex != -1 && ippData.length > pdfStartIndex + 3) {
-      if (ippData[pdfStartIndex + 1] == 80 && // 'P'
-          ippData[pdfStartIndex + 2] == 68 && // 'D'
-          ippData[pdfStartIndex + 3] == 70) {
-        // 'F'
-        print("📄 Found PDF data starting at index: $pdfStartIndex");
-        Uint8List pdfBytes = ippData.sublist(pdfStartIndex);
-        print("PDF Data: $pdfBytes");
-      } else {
-        print("❌ PDF Signature Not Found!");
-      }
-    } else {
-      print("❌ No PDF Signature in the IPP Request");
-    }
-  }
-
   Future<Uint8List> receivePdfData(HttpRequest request) async {
     List<int> receivedData = [];
     await for (var data in request) {
       receivedData.addAll(data);
     }
-    saveIPPDocument(Uint8List.fromList(receivedData));
     return Uint8List.fromList(receivedData);
   }
 
-  void saveIPPDocument(Uint8List ippData) async {
-    // Find the end of the IPP attribute section
-    int docStartIndex = ippData.indexOf(0x03); // 0x03 marks end of attributes
 
-    if (docStartIndex == -1) {
-      print("Invalid IPP data: No end-of-attributes marker found!");
+
+Future<void> saveIPPDocument(Uint8List ippData) async {
+  print("📥 Received IPP Data: ${ippData.length} bytes");
+
+  // Identify the correct start of document
+  int docStartIndex = findDocumentStartIndex(ippData);
+  if (docStartIndex == -1 || docStartIndex >= ippData.length - 1) {
+    print("❌ No valid document data found in the IPP request!");
+    return;
+  }
+
+  // Extract document bytes
+  Uint8List documentData = ippData.sublist(docStartIndex);
+  if (documentData.isEmpty) {
+    print("❌ Document data is empty after IPP headers!");
+    return;
+  }
+
+  print("✅ Extracted Document Data: ${documentData.length} bytes");
+
+  try {
+    // Request permissions
+    if (Platform.isAndroid) {
+      var status = await Permission.manageExternalStorage.request();
+      if (!status.isGranted) {
+        print("❌ Storage permission denied!");
+        return;
+      }
+    }
+
+    // Set file save directory
+    Directory? directory;
+    if (Platform.isAndroid) {
+      directory = Directory("/storage/emulated/0/Download"); // ✅ Save in Downloads folder
+    } else {
+      directory = await getApplicationDocumentsDirectory(); // iOS alternative
+    }
+
+    if (!directory.existsSync()) {
+      print("❌ Storage directory not found!");
       return;
     }
 
-    // Extract document data (after 0x03)
-    Uint8List documentData = ippData.sublist(docStartIndex + 1);
+    // Generate unique filename
+    String filePath = "${directory.path}/printed_document_${DateTime.now().millisecondsSinceEpoch}.pdf";
 
-    // Determine document format (defaulting to PDF)
-    String filePath =
-        "/storage/emulated/0/Download/printed_document.pdf"; // Android storage path
+    // Write file
     File file = File(filePath);
-
-    // Write extracted data to file
     await file.writeAsBytes(documentData);
 
-    print("Document saved at: $filePath");
+    print("📂 Document saved at: $filePath");
+  } catch (e) {
+    print("❌ Error saving document: $e");
+  }
+}
+
+// Function to identify correct start index
+
+
+
+  int findDocumentStartIndex(Uint8List ippData) {
+    int minDocumentSize = 100; // A rough threshold for skipping small headers
+
+    for (int i = 0; i < ippData.length - minDocumentSize; i++) {
+      // If we detect a big jump in values (possible start of binary document)
+      if (ippData[i] == 0x00 && ippData[i + 1] > 0x10) {
+        return i + 1; // Start from the next byte
+      }
+    }
+
+    return -1; // If no valid document start is found
+  }
+
+// void debugIppData(Uint8List ippData) {
+//   print("📥 Debugging IPP Data Length: ${ippData.length} bytes");
+
+//   // Print first 50 bytes (adjust if needed)
+//   int lengthToPrint = ippData.length < 50 ? ippData.length : 50;
+//   print("🔍 First $lengthToPrint bytes: ${ippData.sublist(0, lengthToPrint)}");
+
+//   int pdfStartIndex = ippData.indexOf(0x25); // '%' = 0x25 (PDF signature)
+//   if (pdfStartIndex != -1) {
+//     print("📄 Found possible document data starting at index: $pdfStartIndex");
+//   } else {
+//     print("❌ No recognizable document data found!");
+//   }
+// }
+
+  Future<String> convertToPDF(String inputFilePath) async {
+    String outputFilePath =
+        inputFilePath.replaceAll(RegExp(r"\.(ps|pcl)$"), ".pdf");
+
+    try {
+      if (inputFilePath.endsWith(".ps")) {
+        await Process.run("gs", [
+          "-dNOPAUSE",
+          "-dBATCH",
+          "-sDEVICE=pdfwrite",
+          "-sOutputFile=$outputFilePath",
+          inputFilePath
+        ]);
+      } else if (inputFilePath.endsWith(".pcl")) {
+        await Process.run("pcl6", [
+          "-sDEVICE=pdfwrite",
+          "-sOutputFile=$outputFilePath",
+          inputFilePath
+        ]);
+      }
+      return outputFilePath;
+    } catch (e) {
+      print("❌ Conversion failed: $e");
+      return "";
+    }
   }
 
   void handlePrint() {
@@ -239,91 +332,19 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
           builder: (context) => PdfViewerScreen(pdfBytes: _pdfData!),
         ),
       );
-    } else {
-      print("⚠️ No PDF Available to Print!");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('❌ PDF not found!')),
-      );
     }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text('Flutter Print Service')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              _isServiceRunning
-                  ? "📡 Print Service Running"
-                  : "❌ Print Service Stopped",
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            SizedBox(height: 20),
-            ElevatedButton(
-              onPressed:
-                  _isServiceRunning ? stopBonjourService : startBonjourService,
-              child: Text(_isServiceRunning ? "Stop Service" : "Start Service"),
-            ),
-          ],
-        ),
-      ),
-    );
   }
 }
 
 class PdfViewerScreen extends StatelessWidget {
   final Uint8List pdfBytes;
-
   const PdfViewerScreen({super.key, required this.pdfBytes});
 
   @override
   Widget build(BuildContext context) {
-    if (pdfBytes.isEmpty) {
-      return Scaffold(
-        appBar: AppBar(title: Text('PDF Viewer')),
-        body: Center(child: Text("❌ PDF data is empty!")),
-      );
-    }
-
     return Scaffold(
       appBar: AppBar(title: Text('PDF Viewer')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              "PDF Loaded Successfully!",
-              style: TextStyle(fontSize: 16, color: Colors.blue),
-            ),
-            SizedBox(height: 20),
-            Expanded(
-              child: PDFView(
-                pdfData: pdfBytes,
-                enableSwipe: true,
-                swipeHorizontal: true,
-                autoSpacing: true,
-                pageFling: true,
-                pageSnap: true,
-                onPageChanged: (int? current, int? total) {
-                  print("Current page: $current / Total pages: $total");
-                },
-                onViewCreated: (PDFViewController pdfViewController) {
-                  print("PDFView created");
-                },
-                onError: (error) {
-                  print("❌ PDFView Error: $error");
-                },
-                onPageError: (page, error) {
-                  print("❌ Error on page $page: $error");
-                },
-              ),
-            ),
-          ],
-        ),
-      ),
+      body: PDFView(pdfData: pdfBytes),
     );
   }
 }
