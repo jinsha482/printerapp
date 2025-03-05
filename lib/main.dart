@@ -1,4 +1,3 @@
-
 import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
@@ -9,7 +8,6 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:bonsoir/bonsoir.dart';
 import 'package:path_provider/path_provider.dart';
-
 
 const int IPP_TAG_END_OF_ATTRIBUTES = 0x03;
 const int IPP_OPERATION_PRINT_JOB = 0x0002;
@@ -167,26 +165,59 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
     );
   }
 
+  Future<String> _getLocalIP() async {
+    final interfaces = await NetworkInterface.list();
+    for (final interface in interfaces) {
+      for (final addr in interface.addresses) {
+        if (!addr.isLoopback && addr.type == InternetAddressType.IPv4) {
+          return addr.address;
+        }
+      }
+    }
+    return 'localhost'; // Fallback if no IP found
+  }
+
   Future<void> startBonjourService() async {
     if (_isServiceRunning) return;
-    await stopBonjourService();
+    await stopBonjourService(); // Cleanup previous instance
 
-    _bonsoirBroadcast = BonsoirBroadcast(
-      service: BonsoirService(
-        name: 'FlutterPrintService',
-        type: '_ipp._tcp',
-        port: 8080,
-      ),
-    );
+    final localIP = await _getLocalIP();
+    print(localIP);
+    _serviceBox.put('localIP', localIP); // Store in Hi
+  final service = BonsoirService(
+    name: 'Flutter Printer',
+    type: '_ipp._tcp',
+    port: 8080,
+    attributes: {
+      // AirPrint mandatory fields
+      'txtvers': '1',
+      'adminurl': 'http://${localIP}:8080',
+      'note': 'Flutter Printer',
+      'pdl': 'application/pdf,image/urf',
+      'product': '(Flutter AirPrint)',
+      'printer-type': '0x0480FFFC', // Magic number for AirPrint
+      'printer-state': '3', // 3 = idle
+      'URF': 'W8,SRGB24,CP1,RS600', // Apple Raster capabilities
+      'rp': 'ipp/print', // Must match your URI path
+      'qtotal': '1',
+      'usb_MFG': 'Flutter',
+      'usb_MDL': 'AirPrint',
+    },
+  );
+
+    _bonsoirBroadcast = BonsoirBroadcast(service: service);
 
     try {
-      await _bonsoirBroadcast!.ready;
+      // Add these 2 critical lines
+      await _bonsoirBroadcast!
+          .ready; // Wait for platform channel initialization
       await _bonsoirBroadcast!.start();
+
       setState(() => _isServiceRunning = true);
       _serviceBox.put('isServiceRunning', true);
-      print("🔔 Bonjour service started and printer attributes ready.");
     } catch (error) {
-      print("❌ Failed to start Bonjour service: $error");
+      print("Bonsoir start failed: $error");
+      _bonsoirBroadcast = null;
     }
   }
 
@@ -207,27 +238,26 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
       print("Server running on port 8080");
       // The server enters an infinite loop to process incoming IPP requests.
       await for (HttpRequest request in _server!) {
+        request.response.headers.chunkedTransferEncoding = false;
+        print("Received request on path: ${request.uri}");
         try {
           final data = await _readFullRequest(request);
-          // Process the IPP request and obtain response bytes.
           final responseBytes =
               await _processIppRequest(data, request.response);
-          print(responseBytes.toString());
 
           if (responseBytes != null) {
             request.response
               ..headers.contentType = ContentType("application", "ipp")
               ..statusCode = HttpStatus.ok
+              ..contentLength = responseBytes.length // Add content length
               ..add(responseBytes);
-
-            print('✅ Response sent.');
           }
+
+          await request.response.close(); // 👈 Explicit close
         } catch (e) {
           print("Request error: $e");
           request.response.statusCode = HttpStatus.internalServerError;
-        } finally {
-          await request.response.close(); // Ensure response is closed.
-          print("Waiting for next IPP request...");
+          await request.response.close(); // 👈 Close even on errors
         }
       }
     } catch (e) {
@@ -243,62 +273,65 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
         )
         .then((bb) => bb.takeBytes());
   }
-
-  Future<Uint8List?> _processIppRequest(
-      Uint8List data, HttpResponse response) async {
-    try {
-      final parser = IppParser(data);
-      print(
-          "Processing IPP request. Operation ID: 0x${parser.operationId.toRadixString(16)}");
-      response.headers.contentType = ContentType("application", "ipp");
-
-      switch (parser.operationId) {
-        // When a Get-Printer-Attributes request is received…
-        case IPP_OPERATION_GET_PRINTER_ATTRIBUTES:
-          // Build and send the printer attributes response.
-          final resBytes = _handlePrinterAttributes(response);
-
-          return resBytes;
-        // When a Print-Job request is received…
-        case IPP_OPERATION_PRINT_JOB:
-          return await _handlePrintJob(parser, response);
-        default:
-          _sendIppError(response, 0x0501, "Unsupported operation");
-          return null;
-      }
-    } catch (e) {
-      _sendIppError(response, 0x0400, "Invalid request");
-      return null;
+Future<Uint8List?> _processIppRequest(
+    Uint8List data, HttpResponse response) async {
+  try {
+    print("📦 Raw IPP header: ${data.sublist(0, 8)}"); // First 8 bytes
+    final parser = IppParser(data);
+    final hexOpId = parser.operationId.toRadixString(16).padLeft(4, '0');
+    print("🔄 Operation ID: 0x$hexOpId (${parser.operationId})");
+    
+    switch (parser.operationId) {
+      case IPP_OPERATION_GET_PRINTER_ATTRIBUTES:
+        print("ℹ️ Handling Get-Printer-Attributes");
+        return _handlePrinterAttributes(response);
+      case IPP_OPERATION_PRINT_JOB:
+        print("🖨️ Handling Print-Job request");
+        return await _handlePrintJob(parser, response);
+      default:
+        print("⚠️ Unsupported operation: 0x$hexOpId");
+        _sendIppError(response, 0x0501, "Unsupported operation");
+        return null;
     }
+  } catch (e, stack) {
+    print("💥 Processing error: $e\n$stack");
+    _sendIppError(response, 0x0400, "Invalid request");
+    return null;
   }
-
+}
   Uint8List _handlePrinterAttributes(HttpResponse response) {
-    print('Entering _handlePrinterAttributes');
-    try {
-      final builder = IppResponseBuilder()
-        ..setVersion(1, 1)
-        ..setStatusCode(0x0000)
-        ..setRequestId(1)
-        ..addAttributeGroup(IppTag.OPERATION_ATTRIBUTES_TAG)
-        ..addString('attributes-charset', 'utf-8')
-        ..addString('attributes-natural-language', 'en-us')
-        ..addAttributeGroup(IppTag.PRINTER_ATTRIBUTES_TAG)
-        ..addString('printer-name', 'Flutter Printer')
-        ..addStringList('document-format-supported', ['application/pdf'])
-        ..addBoolean('printer-is-accepting-jobs', true);
+    final localIP = _serviceBox.get('localIP', defaultValue: 'localhost');
+    print(localIP);
+    final builder = IppResponseBuilder()
+      ..setVersion(1, 1)
+      ..setStatusCode(0x0000) // Success
+      ..setRequestId(1)
+      ..addIntegerList(
+    'operations-supported',
+    [IPP_OPERATION_PRINT_JOB, IPP_OPERATION_GET_PRINTER_ATTRIBUTES],
+      )
+  
 
-      response.statusCode = HttpStatus.ok;
-      final responseBytes = builder.build();
-      print(
-          "Printer attributes built. Response bytes length: ${responseBytes.length}");
-      print(responseBytes.toString());
-      return responseBytes;
-    } catch (e) {
-      print("Error in _handlePrinterAttributes: $e");
-      return Uint8List(0);
-    }
+      ..addAttributeGroup(IppTag.OPERATION_ATTRIBUTES_TAG)
+      ..addString('attributes-charset', 'utf-8')
+      ..addString('attributes-natural-language', 'en-us')
+      ..addAttributeGroup(IppTag.PRINTER_ATTRIBUTES_TAG)
+      ..addString('printer-name', 'Flutter Printer')
+      ..addString('printer-uri-supported',
+          'ipp://$localIP:8080/ipp/print') // Must match Bonjour "rp"
+      ..addStringList('document-format-supported', ['application/pdf'])
+      ..addString('uri-security-supported', 'none')
+      ..addString(
+          'printer-state', 'idle') // Must be "idle", "processing", or "stopped"
+      ..addString('printer-state-reasons', 'none')
+      
+      ..addBoolean('printer-is-accepting-jobs', true);
+
+    return builder.build();
   }
 
+// Helper to convert operation names to IPP codes
+  
   void _sendIppError(HttpResponse response, int code, String message) {
     final builder = IppResponseBuilder()
       ..setVersion(1, 1)
@@ -339,19 +372,23 @@ class _PrintServiceScreenState extends State<PrintServiceScreen> {
   }
 
   void _displayPdf(Uint8List pdfData) {
-    // Navigate to PdfViewerScreen to show the PDF content.
-    Navigator.push(
+    if (context.mounted) {
+      Navigator.push(
         context,
         MaterialPageRoute(
-            builder: (context) => PdfViewerScreen(pdfBytes: pdfData)));
+          builder: (context) => PdfViewerScreen(pdfBytes: pdfData),
+        ),
+      );
+    }
   }
 
-  bool _validatePdf(Uint8List data) =>
-      data.length > 4 &&
-      data[0] == 0x25 &&
-      data[1] == 0x50 &&
-      data[2] == 0x44 &&
-      data[3] == 0x46;
+  bool _validatePdf(Uint8List data) {
+    if (data.length < 4) return false;
+    return data[0] == 0x25 && // %
+        data[1] == 0x50 && // P
+        data[2] == 0x44 && // D
+        data[3] == 0x46; // F
+  }
 
   Future<void> _savePdf(Uint8List data) async {
     final dir = await getApplicationDocumentsDirectory();
@@ -435,6 +472,14 @@ class IppResponseBuilder {
     _buffer.addByte(tag);
   }
 
+  IppResponseBuilder addIntegerList(String name, List<int> values) {
+    for (final value in values) {
+      _addAttributeHeader(name, 0x23); // Integer type
+      _buffer.add(uint32Bytes(value));
+    }
+    return this;
+  }
+
   Uint8List build() {
     _buffer.addByte(IppTag.END_OF_ATTRIBUTES);
     return _buffer.toBytes();
@@ -442,34 +487,52 @@ class IppResponseBuilder {
 }
 
 class IppParser {
-  final ByteData _data;
-  int _offset = 8;
+  final Uint8List _data;
+  int _offset = 0;
 
-  IppParser(Uint8List bytes) : _data = ByteData.sublistView(bytes);
+  IppParser(Uint8List bytes) : _data = bytes;
+ int get operationId {
+    // Bytes 2-3: Operation ID (big-endian)
+    return (_data[2] << 8) | _data[3]; 
+    
+    // Was previously using wrong offset
+  }
 
-  int get operationId => _data.getUint16(2, Endian.big);
-
-  Uint8List? getDocumentData() {
-    while (_offset < _data.lengthInBytes) {
-      final tag = _data.getUint8(_offset++);
-      if (tag == IPP_TAG_END_OF_ATTRIBUTES) {
-        // PDF data starts immediately after the end tag
-        final pdfStart = _offset;
-        final pdfLength = _data.lengthInBytes - pdfStart;
-        if (pdfLength <= 0) return null;
-        return _data.buffer.asUint8List(pdfStart, pdfLength);
-      }
-
-      // Skip attribute groups (printer, job, etc.)
-      if (tag >= 0x01 && tag <= 0x04) continue;
-
-      // Skip other attributes (name, value)
-      final nameLength = _data.getUint16(_offset, Endian.big);
-      _offset += 2 + nameLength; // Skip name length and name
-      _offset += 1; // Skip value tag
-      final valueLength = _data.getUint16(_offset, Endian.big);
-      _offset += 2 + valueLength; // Skip value length and value
+ Uint8List? getDocumentData() {
+  _offset = 8; // Skip version (2), operation (2), request-id (4)
+  
+  while (_offset < _data.length - 1) {
+    final tag = _data[_offset++];
+    
+    if (tag == IPP_TAG_END_OF_ATTRIBUTES) {
+      print("✅ Found end-of-attributes at offset $_offset");
+      return _data.sublist(_offset + 1); // Return remaining bytes as PDF
     }
-    return null;
+
+    if (tag >= 0x01 && tag <= 0x04) {
+      print("⚙️ Skipping attribute group tag: 0x${tag.toRadixString(16)}");
+      continue;
+    }
+
+    // Read attribute name
+    final nameLength = _readUint16(_offset);
+    _offset += 2;
+    final name = String.fromCharCodes(_data.sublist(_offset, _offset + nameLength));
+    _offset += nameLength;
+
+    // Read value tag and value
+    final valueTag = _data[_offset++];
+    final valueLength = _readUint16(_offset);
+    _offset += 2;
+    _offset += valueLength; // Skip value bytes
+
+    print("🔍 Attribute: $name (tag: 0x${valueTag.toRadixString(16)}, length: $valueLength)");
+  }
+  
+  print("⚠️ Reached end of data without finding PDF content");
+  return null;
+}
+  int _readUint16(int offset) {
+    return (_data[offset] << 8) | _data[offset + 1];
   }
 }
